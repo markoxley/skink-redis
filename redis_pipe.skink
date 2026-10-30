@@ -1,0 +1,74 @@
+// File:    redis_pipe.skink
+// Purpose: Command pipelining for the Redis client. Pipeline collects
+//          commands client-side, flushes them in one write, and reads
+//          the replies back in order — one round trip regardless of
+//          command count.
+module redis_pipe
+
+import "redis_client"
+import "redis_resp"
+import "std/str"
+import "std/errors"
+
+// NewPipeline creates a command pipeline bound to a client.
+pub fn NewPipeline(c: *redis_client.Client) -> Pipeline {
+    return Pipeline{c: c}
+}
+
+// Pipeline buffers commands for one-round-trip execution.
+pub struct Pipeline {
+    c:    *redis_client.Client // owning client
+    cmds: [][]string           // buffered commands in order
+
+    // Len returns the number of queued commands.
+    pub fn Len(self: *Pipeline) -> int {
+        return len(self.cmds)
+    }
+
+    // Add queues a command (args[0] = command name).
+    pub fn Add(self: *Pipeline, args: []string) {
+        self.cmds = append(self.cmds, args)
+    }
+
+    // Add2/Add3 are conveniences for fixed-arity commands.
+    pub fn Add2(self: *Pipeline, cmd: string, a: string) {
+        self.Add([]string{cmd, a})
+    }
+
+    pub fn Add3(self: *Pipeline, cmd: string, a: string, b: string) {
+        self.Add([]string{cmd, a, b})
+    }
+
+    // Exec flushes every queued command in one write, then reads the
+    // replies in order. Element order matches Add order; per-command
+    // errors stay in their Resp (KindError) rather than failing the
+    // batch — a transport-level failure fails the whole Exec.
+    pub fn Exec(self: *Pipeline) -> ([]redis_resp.Resp, errors.Error) {
+        var out []redis_resp.Resp
+        count := len(self.cmds)
+        if count == 0 {
+            return out, errors.New("")
+        }
+        bc := self.c.Raw()
+        // Serialize the whole batch into one buffer.
+        b := str.NewBuilder(256 * count)
+        for i := 0; i < count; i = i + 1 {
+            b.Write(redis_resp.EncodeCommand(self.cmds[i]))
+        }
+        wire := b.String()
+        b.Free()
+        werr := bc.WriteAll(wire, str.Len(wire))
+        self.cmds = [][]string{} // commands are on the wire regardless
+        if str.Len(werr.message) > 0 {
+            return out, werr
+        }
+        for i := 0; i < count; i = i + 1 {
+            r, rerr := redis_resp.ReadReply(bc)
+            if str.Len(rerr.message) > 0 {
+                return out, rerr
+            }
+            out = append(out, r)
+        }
+        return out, errors.New("")
+    }
+}

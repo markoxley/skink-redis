@@ -1,0 +1,218 @@
+// File:    redis_dbx.skink
+// Purpose: dbx driver adapter for Redis. Registers a dbx.Driver under
+//          the "redis" scheme ("rediss://" selects TLS) so generic code
+//          can reach Redis through dbx.Open. Redis isn't relational, so
+//          the mapping is: Query/Exec treat the sql string as the
+//          command name and the args as its arguments; Begin runs MULTI
+//          and the Tx queues commands until Commit (EXEC) or Rollback
+//          (DISCARD). Joins are meaningless here — the ORM disables them
+//          for non-SQL drivers.
+module redis_dbx
+
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "mod/markoxley/skink-dbx/dbx_rows"
+import "mod/markoxley/skink-dbx/dbx_driver"
+import "redis_client"
+import "redis_resp"
+import "std/str"
+import "std/errors"
+
+// cmdArgs flattens a (sql, args) dbx call into a Redis command argv:
+// the sql is the command name (upper-cased), each arg renders via its
+// dbx_value kind.
+fn cmdArgs(sql: string, args: []dbx_value.Value) -> []string {
+    out := []string{str.ToUpper(str.Trim(sql))}
+    for i := 0; i < len(args); i = i + 1 {
+        v := args[i]
+        if v.Kind == dbx_value.KIND_BLOB {
+            out = append(out, dbx_value.Bytes(v))
+        } else {
+            out = append(out, dbx_value.AsString(v))
+        }
+    }
+    return out
+}
+
+// respToValue converts one RESP reply into a dbx Value.
+fn respToValue(r: redis_resp.Resp) -> dbx_value.Value {
+    if r.Kind == redis_resp.KindNull {
+        return dbx_value.Null()
+    }
+    if r.Kind == redis_resp.KindInt || r.Kind == redis_resp.KindBigNum {
+        return dbx_value.Int(r.Num)
+    }
+    if r.Kind == redis_resp.KindDouble {
+        return dbx_value.Float(r.Dbl)
+    }
+    if r.Kind == redis_resp.KindBool {
+        return dbx_value.Bool(r.Bool)
+    }
+    if r.Kind == redis_resp.KindBulkStr {
+        return dbx_value.Blob(r.Str, r.Len)
+    }
+    return dbx_value.Text(redis_resp.AsString(r))
+}
+
+// respToRows flattens a reply into a Rows: scalars become a single
+// "value" column/row; arrays/sets become one row per element; maps
+// become key/value column pairs.
+fn respToRows(r: redis_resp.Resp) -> dbx_rows.Rows {
+    if r.Kind == redis_resp.KindArray || r.Kind == redis_resp.KindSet || r.Kind == redis_resp.KindPush {
+        var data [][]dbx_value.Value
+        for i := 0; i < len(r.Items); i = i + 1 {
+            data = append(data, []dbx_value.Value{respToValue(r.Items[i])})
+        }
+        return dbx_rows.NewRows([]string{"value"}, data)
+    }
+    if r.Kind == redis_resp.KindMap {
+        var data [][]dbx_value.Value
+        for i := 0; i + 1 < len(r.Items); i = i + 2 {
+            data = append(data, []dbx_value.Value{respToValue(r.Items[i]), respToValue(r.Items[i + 1])})
+        }
+        return dbx_rows.NewRows([]string{"key", "value"}, data)
+    }
+    var data [][]dbx_value.Value
+    data = append(data, []dbx_value.Value{respToValue(r)})
+    return dbx_rows.NewRows([]string{"value"}, data)
+}
+
+// clientBoxes is the handle table behind Conn.State. Skink cannot cast
+// an int64 back to a *Client, so each connection's Client lives in a
+// len-1 slice — `&s[0]` is a stable heap pointer — stored under an int
+// handle. The handle doubles as Conn.State.
+var clientBoxes map[int][]redis_client.Client
+var clientNext = 1
+
+// boxClient stores a Client and returns its handle.
+fn boxClient(c: redis_client.Client) -> int64 {
+    if clientBoxes == nil {
+        clientBoxes = make(map[int][]redis_client.Client)
+    }
+    s := make([]redis_client.Client, 1)
+    s[0] = c
+    h := clientNext
+    clientNext = clientNext + 1
+    clientBoxes[h] = s
+    return int64(h)
+}
+
+// clientOf recovers the Client from a Conn's opaque State.
+fn clientOf(c: *dbx_driver.Conn) -> *redis_client.Client {
+    return &clientBoxes[int(c.State)][0]
+}
+
+// dropClient releases a handle's box (called from closeImpl).
+fn dropClient(h: int64) {
+    if clientBoxes != nil {
+        delete(clientBoxes, int(h))
+    }
+}
+
+fn queryImpl(c: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    cl := clientOf(c)
+    r, err := cl.Do(cmdArgs(sql, args))
+    if str.Len(err.message) > 0 {
+        return dbx_rows.EmptyRows([]string{"value"}), err
+    }
+    return respToRows(r), errors.New("")
+}
+
+fn execImpl(c: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    cl := clientOf(c)
+    r, err := cl.Do(cmdArgs(sql, args))
+    if str.Len(err.message) > 0 {
+        return int64(0), err
+    }
+    if r.Kind == redis_resp.KindInt {
+        return r.Num, errors.New("")
+    }
+    return int64(1), errors.New("")
+}
+
+fn pingImpl(c: *dbx_driver.Conn) -> errors.Error {
+    return clientOf(c).Ping()
+}
+
+fn closeImpl(c: *dbx_driver.Conn) -> errors.Error {
+    err := clientOf(c).Close()
+    dropClient(c.State)
+    return err
+}
+
+// === transactions (MULTI/EXEC/DISCARD) ===
+
+// txOf recovers the *Client (whose next commands are queued under
+// MULTI) from a Tx's opaque State — same handle table as Conn.State.
+fn txOf(t: *dbx_driver.Tx) -> *redis_client.Client {
+    return &clientBoxes[int(t.State)][0]
+}
+
+// In MULTI mode every command replies +QUEUED; the real results come
+// back as EXEC's array reply.
+fn txExecImpl(t: *dbx_driver.Tx, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    cl := txOf(t)
+    r, err := cl.Do(cmdArgs(sql, args))
+    if str.Len(err.message) > 0 {
+        return int64(0), err
+    }
+    if !str.Equal(redis_resp.AsString(r), "QUEUED") {
+        return int64(0), errors.New(str.Concat("redis: expected QUEUED, got ", redis_resp.AsString(r)))
+    }
+    return int64(0), errors.New("")
+}
+
+fn txQueryImpl(t: *dbx_driver.Tx, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    _, err := txExecImpl(t, sql, args)
+    return dbx_rows.EmptyRows([]string{"value"}), err
+}
+
+fn txCommitImpl(t: *dbx_driver.Tx) -> errors.Error {
+    cl := txOf(t)
+    _, err := cl.Do1("EXEC")
+    return err
+}
+
+fn txRollbackImpl(t: *dbx_driver.Tx) -> errors.Error {
+    cl := txOf(t)
+    _, err := cl.Do1("DISCARD")
+    return err
+}
+
+fn beginImpl(c: *dbx_driver.Conn) -> (dbx_driver.Tx, errors.Error) {
+    cl := clientOf(c)
+    _, err := cl.Do1("MULTI")
+    if str.Len(err.message) > 0 {
+        return dbx_driver.Tx{}, err
+    }
+    c.InTx = true
+    t := dbx_driver.Tx{State: c.State}
+    t.queryFn = txQueryImpl
+    t.execFn = txExecImpl
+    t.commitFn = txCommitImpl
+    t.rollbackFn = txRollbackImpl
+    return t, errors.New("")
+}
+
+// openImpl is the dbx Driver.Open entry point for "redis"/"rediss".
+fn openImpl(info: dbx_dsn.ConnInfo) -> (dbx_driver.Conn, errors.Error) {
+    // Rebuild the DSN — DialDSN centralizes AUTH/SELECT/TLS handling.
+    cl, err := redis_client.DialDSN(info.Raw)
+    if str.Len(err.message) > 0 {
+        return dbx_driver.Conn{}, err
+    }
+    conn := dbx_driver.Conn{Name: "redis", State: boxClient(cl)}
+    conn.queryFn = queryImpl
+    conn.execFn = execImpl
+    conn.pingFn = pingImpl
+    conn.beginFn = beginImpl
+    conn.closeFn = closeImpl
+    return conn, errors.New("")
+}
+
+// Register installs the Redis driver into the dbx registry so
+// dbx.Open("redis://...") works. Call once at program start when the
+// generic dbx entry point is needed.
+pub fn Register() {
+    dbx_driver.RegisterDriver(dbx_driver.Driver{Name: "redis", Open: openImpl})
+}

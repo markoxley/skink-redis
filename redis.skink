@@ -1,0 +1,72 @@
+// File:    redis.skink
+// Purpose: Root module for skink-redis. Re-exports the client, RESP
+//          codec, pipeline and pub/sub entry points so applications
+//          need only `import "mod/markoxley/skink-redis"`. Call
+//          redis.Register() once to make "redis://"/"rediss://" DSNs
+//          work through the generic dbx.Open entry point.
+//
+//          Type names live in the submodules (redis_client.Client,
+//          redis_resp.Resp, ...) — rely on `:=` inference, or import a
+//          submodule directly to name the types explicitly.
+module redis
+
+import "mod/markoxley/skink-dbx/dbx_driver"
+import "redis_resp"
+import "redis_client"
+import "redis_pipe"
+import "redis_pubsub"
+import "redis_dbx"
+import "std/errors"
+
+// RESP kind constants.
+pub const KindSimpleStr = redis_resp.KindSimpleStr
+pub const KindError     = redis_resp.KindError
+pub const KindInt       = redis_resp.KindInt
+pub const KindBulkStr   = redis_resp.KindBulkStr
+pub const KindArray     = redis_resp.KindArray
+pub const KindNull      = redis_resp.KindNull
+pub const KindBool      = redis_resp.KindBool
+pub const KindDouble    = redis_resp.KindDouble
+pub const KindBigNum    = redis_resp.KindBigNum
+pub const KindMap       = redis_resp.KindMap
+pub const KindSet       = redis_resp.KindSet
+pub const KindPush      = redis_resp.KindPush
+
+// Message kind constants.
+pub const MsgSubscribe   = redis_pubsub.MsgSubscribe
+pub const MsgUnsubscribe = redis_pubsub.MsgUnsubscribe
+pub const MsgMessage     = redis_pubsub.MsgMessage
+pub const MsgPMessage    = redis_pubsub.MsgPMessage
+pub const MsgPong        = redis_pubsub.MsgPong
+
+// Dial connects using a redis:// or rediss:// DSN:
+//   redis://[user:pass@]host[:port][/db][?protocol=3][&timeout_ms=N]
+pub fn Dial(dsn: string) -> (redis_client.Client, errors.Error) {
+    return redis_client.DialDSN(dsn)
+}
+
+// Connect opens a plaintext connection and performs AUTH/SELECT.
+pub fn Connect(host: string, port: int, dbIndex: int, user: string, password: string, timeoutMs: int) -> (redis_client.Client, errors.Error) {
+    return redis_client.Connect(host, port, dbIndex, user, password, timeoutMs)
+}
+
+// NewPipeline creates a command pipeline bound to a client.
+pub fn NewPipeline(c: *redis_client.Client) -> redis_pipe.Pipeline {
+    return redis_pipe.NewPipeline(c)
+}
+
+// NewPubSub consumes a client connection for subscribe-mode use.
+pub fn NewPubSub(c: redis_client.Client) -> redis_pubsub.PubSub {
+    return redis_pubsub.NewPubSub(c)
+}
+
+// DialPubSub connects and returns a PubSub bound to the new conn.
+pub fn DialPubSub(dsn: string) -> (redis_pubsub.PubSub, errors.Error) {
+    return redis_pubsub.DialPubSub(dsn)
+}
+
+// Register installs the driver into the dbx registry so
+// dbx.Open("redis://...") works.
+pub fn Register() {
+    redis_dbx.Register()
+}

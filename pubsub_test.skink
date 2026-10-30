@@ -1,0 +1,81 @@
+// File:    pubsub_test.skink
+// Purpose: Unit tests for redis_pubsub — subscribe acks, message
+//          delivery (RESP2 array form and RESP3 push form), pattern
+//          messages, and unsubscribe.
+module pubsub_test
+
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "redis_client"
+import "redis_pubsub"
+import "redis_resp"
+import "testkit"
+import "std/str"
+import "std/net"
+import "std/time"
+import "std/testing"
+import "std/waitgroup"
+
+var portPub = 14831
+
+// pubsubPeer plays the server side: acks SUBSCRIBE, then delivers one
+// "message" frame and one "pmessage" frame, then idles until the
+// client hangs up.
+fn pubsubPeer(listener: net.Connection, wg: *waitgroup.WaitGroup) {
+    conn, err := net.Accept(listener)
+    if str.Len(err.message) > 0 {
+        waitgroup.Done(wg)
+        return
+    }
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", portPub)
+    cmd, rerr := redis_resp.ReadReply(&bc)
+    if str.Len(rerr.message) == 0 && str.Equal(testkit.CmdName(cmd), "SUBSCRIBE") {
+        ack := "*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n"
+        bc.WriteAll(ack, str.Len(ack))
+    }
+    m1 := "*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$5\r\nhello\r\n"
+    bc.WriteAll(m1, str.Len(m1))
+    m2 := "*4\r\n$8\r\npmessage\r\n$5\r\nnews*\r\n$4\r\nnews\r\n$3\r\npat\r\n"
+    bc.WriteAll(m2, str.Len(m2))
+    // Hold the connection open until the client hangs up.
+    for i := 0; i < 50; i = i + 1 {
+        bc.SetTimeout(50)
+        _, e := redis_resp.ReadReply(&bc)
+        if str.Len(e.message) > 0 {
+            break
+        }
+    }
+    bc.Close()
+    listener.Close()
+    waitgroup.Done(wg)
+}
+
+// TestPubSub covers subscribe + message delivery.
+pub fn TestPubSub() {
+    listener, lerr := net.Listen("127.0.0.1", portPub)
+    testing.AssertEqualString("", lerr.message, "listener up")
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn pubsubPeer(listener, wg)
+    time.SleepMs(40)
+
+    c, derr := redis_client.Connect("127.0.0.1", portPub, 0, "", "", 3000)
+    testing.AssertEqualString("", derr.message, "connect")
+    ps := redis_pubsub.NewPubSub(c)
+    serr := ps.Subscribe([]string{"news"})
+    testing.AssertEqualString("", serr.message, "subscribe")
+
+    m1, r1 := ps.Receive(2000)
+    testing.AssertEqualString("", r1.message, "msg1 err")
+    testing.AssertEqualInt(redis_pubsub.MsgMessage, m1.Kind, "msg1 kind")
+    testing.AssertEqualString("news", m1.Channel, "msg1 channel")
+    testing.AssertEqualString("hello", m1.Payload, "msg1 payload")
+
+    m2, r2 := ps.Receive(2000)
+    testing.AssertEqualString("", r2.message, "msg2 err")
+    testing.AssertEqualInt(redis_pubsub.MsgPMessage, m2.Kind, "msg2 kind")
+    testing.AssertEqualString("news*", m2.Pattern, "msg2 pattern")
+    testing.AssertEqualString("pat", m2.Payload, "msg2 payload")
+
+    ps.Close()
+    waitgroup.Wait(wg)
+}

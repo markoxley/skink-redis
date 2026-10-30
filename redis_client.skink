@@ -1,0 +1,526 @@
+// File:    redis_client.skink
+// Purpose: Redis client over the RESP codec. Client wraps a
+//          dbx_bufconn.BufConn: DialDSN parses redis:// and rediss://
+//          URLs (user:password@host:port/db plus ?db=N, ?protocol=3,
+//          ?timeout_ms=N), performs AUTH/SELECT/HELLO negotiation, and
+//          Do() sends a command and reads its reply. Typed helpers
+//          (Get/Set/Del/...) are thin wrappers over Do.
+//
+//          A Client is NOT safe for concurrent use — run one per
+//          goroutine or take connections from a dbx_pool.Pool.
+module redis_client
+
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "redis_resp"
+import "std/str"
+import "std/strconv"
+import "std/errors"
+
+// Client is one Redis connection.
+pub struct Client {
+    bc:       dbx_bufconn.BufConn // buffered wire transport
+    host:     string              // peer hostname (for redial/pubsub)
+    port:     int                 // peer port
+    db:       int                 // selected logical database
+    user:     string              // ACL username ("" = default)
+    password: string              // AUTH password ("" = none)
+    useTLS:   bool                // rediss:// scheme
+    resp3:    bool                // HELLO 3 negotiated
+    open:     bool
+
+    // Host/Port accessors for introspection and pool bookkeeping.
+    pub fn Host(self: *Client) -> string {
+        return self.host
+    }
+
+    pub fn Port(self: *Client) -> int {
+        return self.port
+    }
+
+    // DB returns the selected logical database index.
+    pub fn DB(self: *Client) -> int {
+        return self.db
+    }
+
+    // IsOpen reports whether the underlying connection is up.
+    pub fn IsOpen(self: *Client) -> bool {
+        return self.open
+    }
+
+    // Raw exposes the buffered transport for protocol-level users.
+    pub fn Raw(self: *Client) -> *dbx_bufconn.BufConn {
+        return &self.bc
+    }
+
+    // Do sends one command (args[0] = command name) and returns the
+    // decoded reply. Reply errors (-ERR) surface as the error return.
+    pub fn Do(self: *Client, args: []string) -> (redis_resp.Resp, errors.Error) {
+        if !self.open {
+            return redis_resp.Resp{}, errors.New("redis: connection closed")
+        }
+        if len(args) == 0 {
+            return redis_resp.Resp{}, errors.New("redis: empty command")
+        }
+        wire := redis_resp.EncodeCommand(args)
+        werr := self.bc.WriteAll(wire, str.Len(wire))
+        if str.Len(werr.message) > 0 {
+            return redis_resp.Resp{}, werr
+        }
+        reply, rerr := redis_resp.ReadReply(&self.bc)
+        if str.Len(rerr.message) > 0 {
+            return redis_resp.Resp{}, rerr
+        }
+        if redis_resp.IsError(reply) {
+            return reply, redis_resp.AsError(reply)
+        }
+        return reply, errors.New("")
+    }
+
+    // Do1/Do2/Do3 are conveniences for fixed-arity commands.
+    pub fn Do1(self: *Client, cmd: string) -> (redis_resp.Resp, errors.Error) {
+        return self.Do([]string{cmd})
+    }
+
+    pub fn Do2(self: *Client, cmd: string, a: string) -> (redis_resp.Resp, errors.Error) {
+        return self.Do([]string{cmd, a})
+    }
+
+    pub fn Do3(self: *Client, cmd: string, a: string, b: string) -> (redis_resp.Resp, errors.Error) {
+        return self.Do([]string{cmd, a, b})
+    }
+
+    // Ping verifies the connection (returns "PONG").
+    pub fn Ping(self: *Client) -> errors.Error {
+        r, err := self.Do1("PING")
+        if str.Len(err.message) > 0 {
+            return err
+        }
+        if !str.Equal(redis_resp.AsString(r), "PONG") {
+            return errors.New("redis: unexpected PING reply")
+        }
+        return errors.New("")
+    }
+
+    // === String commands ===
+
+    // Get returns the value for key (null Resp when absent).
+    pub fn Get(self: *Client, key: string) -> (redis_resp.Resp, errors.Error) {
+        return self.Do2("GET", key)
+    }
+
+    // GetString returns the value or "" (absent keys give "", false).
+    pub fn GetString(self: *Client, key: string) -> (string, bool, errors.Error) {
+        r, err := self.Do2("GET", key)
+        if str.Len(err.message) > 0 {
+            return "", false, err
+        }
+        if redis_resp.IsNull(r) {
+            return "", false, errors.New("")
+        }
+        return redis_resp.AsString(r), true, errors.New("")
+    }
+
+    // Set stores key=value.
+    pub fn Set(self: *Client, key: string, value: string) -> errors.Error {
+        _, err := self.Do3("SET", key, value)
+        return err
+    }
+
+    // SetEx stores key=value with a TTL in seconds.
+    pub fn SetEx(self: *Client, key: string, value: string, ttlSec: int) -> errors.Error {
+        _, err := self.Do([]string{"SET", key, value, "EX", strconv.Itoa(ttlSec)})
+        return err
+    }
+
+    // SetNX stores key=value only when absent; returns true when set.
+    pub fn SetNX(self: *Client, key: string, value: string) -> (bool, errors.Error) {
+        r, err := self.Do([]string{"SET", key, value, "NX"})
+        if str.Len(err.message) > 0 {
+            return false, err
+        }
+        return !redis_resp.IsNull(r), errors.New("")
+    }
+
+    // === Key commands ===
+
+    // Del removes keys; returns the count actually deleted.
+    pub fn Del(self: *Client, keys: []string) -> (int64, errors.Error) {
+        args := []string{"DEL"}
+        for i := 0; i < len(keys); i = i + 1 {
+            args = append(args, keys[i])
+        }
+        r, err := self.Do(args)
+        return redis_resp.AsInt(r), err
+    }
+
+    // Exists reports how many of the given keys exist.
+    pub fn Exists(self: *Client, keys: []string) -> (int64, errors.Error) {
+        args := []string{"EXISTS"}
+        for i := 0; i < len(keys); i = i + 1 {
+            args = append(args, keys[i])
+        }
+        r, err := self.Do(args)
+        return redis_resp.AsInt(r), err
+    }
+
+    // Expire sets a TTL in seconds; true when applied.
+    pub fn Expire(self: *Client, key: string, ttlSec: int) -> (bool, errors.Error) {
+        r, err := self.Do3("EXPIRE", key, strconv.Itoa(ttlSec))
+        return redis_resp.AsInt(r) == int64(1), err
+    }
+
+    // Ttl returns remaining seconds (-2 missing, -1 no expiry).
+    pub fn Ttl(self: *Client, key: string) -> (int64, errors.Error) {
+        r, err := self.Do2("TTL", key)
+        return redis_resp.AsInt(r), err
+    }
+
+    // Keys returns keys matching a glob pattern (use Scan in prod).
+    pub fn Keys(self: *Client, pattern: string) -> ([]string, errors.Error) {
+        r, err := self.Do2("KEYS", pattern)
+        if str.Len(err.message) > 0 {
+            var empty []string
+            return empty, err
+        }
+        return redis_resp.Strings(r), errors.New("")
+    }
+
+    // Type returns the Redis type name of a key.
+    pub fn Type(self: *Client, key: string) -> (string, errors.Error) {
+        r, err := self.Do2("TYPE", key)
+        return redis_resp.AsString(r), err
+    }
+
+    // === Numeric commands ===
+
+    // Incr increments a key by 1 and returns the new value.
+    pub fn Incr(self: *Client, key: string) -> (int64, errors.Error) {
+        r, err := self.Do2("INCR", key)
+        return redis_resp.AsInt(r), err
+    }
+
+    // IncrBy increments a key by delta and returns the new value.
+    pub fn IncrBy(self: *Client, key: string, delta: int64) -> (int64, errors.Error) {
+        r, err := self.Do3("INCRBY", key, strconv.Itoa64(delta))
+        return redis_resp.AsInt(r), err
+    }
+
+    // Decr decrements a key by 1.
+    pub fn Decr(self: *Client, key: string) -> (int64, errors.Error) {
+        r, err := self.Do2("DECR", key)
+        return redis_resp.AsInt(r), err
+    }
+
+    // === Multi-key ===
+
+    // MGet returns values for keys (null entries for missing keys).
+    pub fn MGet(self: *Client, keys: []string) -> (redis_resp.Resp, errors.Error) {
+        args := []string{"MGET"}
+        for i := 0; i < len(keys); i = i + 1 {
+            args = append(args, keys[i])
+        }
+        return self.Do(args)
+    }
+
+    // MSet stores alternating key/value pairs.
+    pub fn MSet(self: *Client, pairs: []string) -> errors.Error {
+        args := []string{"MSET"}
+        for i := 0; i < len(pairs); i = i + 1 {
+            args = append(args, pairs[i])
+        }
+        _, err := self.Do(args)
+        return err
+    }
+
+    // === List commands ===
+
+    pub fn LPush(self: *Client, key: string, values: []string) -> (int64, errors.Error) {
+        args := []string{"LPUSH", key}
+        for i := 0; i < len(values); i = i + 1 {
+            args = append(args, values[i])
+        }
+        r, err := self.Do(args)
+        return redis_resp.AsInt(r), err
+    }
+
+    pub fn RPush(self: *Client, key: string, values: []string) -> (int64, errors.Error) {
+        args := []string{"RPUSH", key}
+        for i := 0; i < len(values); i = i + 1 {
+            args = append(args, values[i])
+        }
+        r, err := self.Do(args)
+        return redis_resp.AsInt(r), err
+    }
+
+    pub fn LPop(self: *Client, key: string) -> (redis_resp.Resp, errors.Error) {
+        return self.Do2("LPOP", key)
+    }
+
+    pub fn RPop(self: *Client, key: string) -> (redis_resp.Resp, errors.Error) {
+        return self.Do2("RPOP", key)
+    }
+
+    // LRange returns elements [start, stop] inclusive (negatives from end).
+    pub fn LRange(self: *Client, key: string, start: int64, stop: int64) -> ([]string, errors.Error) {
+        r, err := self.Do([]string{"LRANGE", key, strconv.Itoa64(start), strconv.Itoa64(stop)})
+        if str.Len(err.message) > 0 {
+            var empty []string
+            return empty, err
+        }
+        return redis_resp.Strings(r), errors.New("")
+    }
+
+    // LLen returns the list length.
+    pub fn LLen(self: *Client, key: string) -> (int64, errors.Error) {
+        r, err := self.Do2("LLEN", key)
+        return redis_resp.AsInt(r), err
+    }
+
+    // === Hash commands ===
+
+    pub fn HSet(self: *Client, key: string, field: string, value: string) -> (int64, errors.Error) {
+        r, err := self.Do([]string{"HSET", key, field, value})
+        return redis_resp.AsInt(r), err
+    }
+
+    pub fn HGet(self: *Client, key: string, field: string) -> (redis_resp.Resp, errors.Error) {
+        return self.Do3("HGET", key, field)
+    }
+
+    // HGetAll returns the flat field/value list for a hash.
+    pub fn HGetAll(self: *Client, key: string) -> ([]string, errors.Error) {
+        r, err := self.Do2("HGETALL", key)
+        if str.Len(err.message) > 0 {
+            var empty []string
+            return empty, err
+        }
+        return redis_resp.Strings(r), errors.New("")
+    }
+
+    pub fn HDel(self: *Client, key: string, fields: []string) -> (int64, errors.Error) {
+        args := []string{"HDEL", key}
+        for i := 0; i < len(fields); i = i + 1 {
+            args = append(args, fields[i])
+        }
+        r, err := self.Do(args)
+        return redis_resp.AsInt(r), err
+    }
+
+    // === Set commands ===
+
+    pub fn SAdd(self: *Client, key: string, members: []string) -> (int64, errors.Error) {
+        args := []string{"SADD", key}
+        for i := 0; i < len(members); i = i + 1 {
+            args = append(args, members[i])
+        }
+        r, err := self.Do(args)
+        return redis_resp.AsInt(r), err
+    }
+
+    pub fn SMembers(self: *Client, key: string) -> ([]string, errors.Error) {
+        r, err := self.Do2("SMEMBERS", key)
+        if str.Len(err.message) > 0 {
+            var empty []string
+            return empty, err
+        }
+        return redis_resp.Strings(r), errors.New("")
+    }
+
+    pub fn SIsMember(self: *Client, key: string, member: string) -> (bool, errors.Error) {
+        r, err := self.Do3("SISMEMBER", key, member)
+        return redis_resp.AsInt(r) == int64(1), err
+    }
+
+    // === Sorted set commands ===
+
+    pub fn ZAdd(self: *Client, key: string, score: float, member: string) -> (int64, errors.Error) {
+        r, err := self.Do([]string{"ZADD", key, strconv.FormatFloat(score, 6), member})
+        return redis_resp.AsInt(r), err
+    }
+
+    // ZRange returns members in [start, stop] rank order.
+    pub fn ZRange(self: *Client, key: string, start: int64, stop: int64) -> ([]string, errors.Error) {
+        r, err := self.Do([]string{"ZRANGE", key, strconv.Itoa64(start), strconv.Itoa64(stop)})
+        if str.Len(err.message) > 0 {
+            var empty []string
+            return empty, err
+        }
+        return redis_resp.Strings(r), errors.New("")
+    }
+
+    // === Server commands ===
+
+    // Select switches the logical database.
+    pub fn Select(self: *Client, db: int) -> errors.Error {
+        _, err := self.Do2("SELECT", strconv.Itoa(db))
+        if str.Len(err.message) == 0 {
+            self.db = db
+        }
+        return err
+    }
+
+    // FlushDB clears the current logical database.
+    pub fn FlushDB(self: *Client) -> errors.Error {
+        _, err := self.Do1("FLUSHDB")
+        return err
+    }
+
+    // DBSize returns the number of keys in the current database.
+    pub fn DBSize(self: *Client) -> (int64, errors.Error) {
+        r, err := self.Do1("DBSIZE")
+        return redis_resp.AsInt(r), err
+    }
+
+    // Echo returns what the server sent back.
+    pub fn Echo(self: *Client, msg: string) -> (string, errors.Error) {
+        r, err := self.Do2("ECHO", msg)
+        return redis_resp.AsString(r), err
+    }
+
+    // Close terminates the connection (sends QUIT best-effort).
+    pub fn Close(self: *Client) -> errors.Error {
+        if !self.open {
+            return errors.New("")
+        }
+        self.open = false
+        wire := redis_resp.EncodeCommand([]string{"QUIT"})
+        self.bc.WriteAll(wire, str.Len(wire))
+        self.bc.Close()
+        return errors.New("")
+    }
+}
+
+// handshake performs post-connect negotiation: optional TLS upgrade,
+// HELLO 3 protocol selection, AUTH and SELECT.
+fn handshake(c: *Client, info: dbx_dsn.ConnInfo, wantResp3: bool) -> errors.Error {
+    if c.useTLS {
+        // Verify the server certificate by default — a rediss:// URL is
+        // meaningless if a MITM can present any cert. Escape hatches for
+        // dev: ?tls_verify=0 or ?insecure_skip_verify=1.
+        skip := dbx_dsn.ParamOr(info, "insecure_skip_verify",
+            dbx_dsn.ParamOr(info, "tls_verify", ""))
+        verify := !str.Equal(skip, "1") && !str.Equal(skip, "true") &&
+            !str.Equal(skip, "0")
+        terr := c.bc.StartTLS(verify)
+        if str.Len(terr.message) > 0 {
+            return terr
+        }
+    }
+    if wantResp3 {
+        // HELLO 3 [AUTH user pass] negotiates RESP3 in one shot.
+        args := []string{"HELLO", "3"}
+        if str.Len(c.password) > 0 {
+            u := c.user
+            if str.Len(u) == 0 {
+                u = "default"
+            }
+            args = append(args, "AUTH")
+            args = append(args, u)
+            args = append(args, c.password)
+        }
+        r, err := c.Do(args)
+        if str.Len(err.message) > 0 {
+            // Pre-6.0 servers reject HELLO — fall back to RESP2 + AUTH.
+            if str.Contains(err.message, "unknown") || str.Contains(err.message, "NOPROTO") || str.Contains(err.message, "unsupported") {
+                c.resp3 = false
+            } else {
+                return err // e.g. AUTH failure inside HELLO
+            }
+        } else if r.Kind == redis_resp.KindMap || r.Kind == redis_resp.KindSimpleStr {
+            c.resp3 = true
+            c.password = "" // already authenticated via HELLO
+        } else {
+            c.resp3 = false
+        }
+    }
+    if str.Len(c.password) > 0 {
+        var r redis_resp.Resp
+        var err errors.Error
+        if str.Len(c.user) > 0 {
+            r, err = c.Do([]string{"AUTH", c.user, c.password})
+        } else {
+            r, err = c.Do2("AUTH", c.password)
+        }
+        if str.Len(err.message) > 0 {
+            return err
+        }
+        if !str.Equal(redis_resp.AsString(r), "OK") {
+            return errors.New("redis: AUTH rejected")
+        }
+    }
+    if c.db != 0 {
+        return c.Select(c.db)
+    }
+    return errors.New("")
+}
+
+// Connect dials host:port in plaintext and runs the handshake.
+// dbIndex selects a logical database (0 = default), password applies
+// AUTH when non-empty.
+pub fn Connect(host: string, port: int, dbIndex: int, user: string, password: string, timeoutMs: int) -> (Client, errors.Error) {
+    bc, err := dbx_bufconn.Dial(host, port, timeoutMs)
+    if str.Len(err.message) > 0 {
+        return Client{}, err
+    }
+    c := Client{bc: bc, host: host, port: port, db: dbIndex, user: user, password: password, open: true}
+    info := dbx_dsn.ConnInfo{}
+    herr := handshake(&c, info, false)
+    if str.Len(herr.message) > 0 {
+        c.bc.Close()
+        return Client{}, herr
+    }
+    c.password = ""
+    return c, errors.New("")
+}
+
+// DialDSN connects from a DSN:
+//   redis://[user:pass@]host[:port][/db][?protocol=3][&timeout_ms=N]
+//   rediss://...            — same, over TLS
+pub fn DialDSN(dsn: string) -> (Client, errors.Error) {
+    info, err := dbx_dsn.ParseDSN(dsn)
+    if str.Len(err.message) > 0 {
+        return Client{}, err
+    }
+    if !str.Equal(info.Scheme, "redis") && !str.Equal(info.Scheme, "rediss") {
+        return Client{}, errors.New(str.Concat("redis: unsupported scheme ", info.Scheme))
+    }
+    port := info.Port
+    if port == 0 {
+        port = 6379
+    }
+    dbIndex := 0
+    if str.Len(info.Database) > 0 {
+        d, ok := strconv.ParseInt(info.Database)
+        if !ok || d < 0 {
+            return Client{}, errors.New(str.Concat("redis: bad db index ", info.Database))
+        }
+        dbIndex = d
+    }
+    timeoutMs := 0
+    tp := dbx_dsn.ParamOr(info, "timeout_ms", "")
+    if str.Len(tp) > 0 {
+        t, ok := strconv.ParseInt(tp)
+        if ok {
+            timeoutMs = t
+        }
+    }
+    proto3 := str.Equal(dbx_dsn.ParamOr(info, "protocol", "2"), "3")
+
+    bc, berr := dbx_bufconn.Dial(info.Host, port, timeoutMs)
+    if str.Len(berr.message) > 0 {
+        return Client{}, berr
+    }
+    c := Client{
+        bc: bc, host: info.Host, port: port, db: dbIndex,
+        user: info.User, password: info.Password,
+        useTLS: str.Equal(info.Scheme, "rediss"), open: true,
+    }
+    herr := handshake(&c, info, proto3)
+    if str.Len(herr.message) > 0 {
+        c.bc.Close()
+        return Client{}, herr
+    }
+    c.password = ""
+    return c, errors.New("")
+}

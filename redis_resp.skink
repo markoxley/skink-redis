@@ -1,0 +1,363 @@
+// File:    redis_resp.skink
+// Purpose: RESP2/RESP3 wire codec for the Redis driver. Resp is the
+//          decoded reply model (all RESP2 types plus the RESP3 set,
+//          map, push, bool, double, bignum, verbatim and attribute
+//          types); EncodeCommand serializes a command as an array of
+//          bulk strings; ReadReply decodes the next reply off a
+//          dbx_bufconn.BufConn.
+//
+//          Note on binary safety: Skink strings are NUL-terminated, so
+//          command arguments cannot contain embedded NUL bytes. Reply
+//          payloads keep their exact wire length in Resp.Len so callers
+//          can process binary data up to that bound.
+module redis_resp
+
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "std/str"
+import "std/strconv"
+import "std/errors"
+import "std/libc"
+
+// RESP type tags (first byte on the wire).
+pub const KindSimpleStr = 1  // +
+pub const KindError     = 2  // -  (and ! blob error)
+pub const KindInt       = 3  // :
+pub const KindBulkStr   = 4  // $  (and = verbatim)
+pub const KindArray     = 5  // *
+pub const KindNull      = 6  // _ or $-1 / *-1
+pub const KindBool      = 7  // #
+pub const KindDouble    = 8  // ,
+pub const KindBigNum    = 9  // (
+pub const KindMap       = 10 // %
+pub const KindSet       = 11 // ~
+pub const KindPush      = 12 // > (out-of-band message, e.g. pub/sub)
+
+// Resp is one decoded RESP value.
+pub struct Resp {
+    Kind:  int     // one of the Kind* constants
+    Str:   string  // payload for simple/bulk/error/verbatim/bignum
+    Len:   int     // exact byte length of Str (>= 0 even with NULs)
+    Num:   int64   // payload for KindInt
+    Dbl:   float   // payload for KindDouble
+    Bool:  bool    // payload for KindBool
+    Items: []Resp  // elements for array/set/push; map keys+values
+                   // alternate (k0, v0, k1, v1, ...)
+}
+
+// IsNull reports whether the reply is RESP null.
+pub fn IsNull(r: Resp) -> bool {
+    return r.Kind == KindNull
+}
+
+// IsError reports whether the reply is an error (-ERR / !).
+pub fn IsError(r: Resp) -> bool {
+    return r.Kind == KindError
+}
+
+// AsString returns the reply payload as a string: Str for string kinds,
+// Num formatted for ints, Dbl formatted for doubles, "true"/"false"
+// for bools. Null and container kinds return "".
+pub fn AsString(r: Resp) -> string {
+    if r.Kind == KindInt {
+        return strconv.Itoa64(r.Num)
+    }
+    if r.Kind == KindDouble {
+        return strconv.FormatFloat(r.Dbl, 6)
+    }
+    if r.Kind == KindBool {
+        if r.Bool {
+            return "true"
+        }
+        return "false"
+    }
+    if r.Kind == KindSimpleStr || r.Kind == KindBulkStr || r.Kind == KindError || r.Kind == KindBigNum {
+        return r.Str
+    }
+    return ""
+}
+
+// AsInt returns the reply as int64 — Num for KindInt, parsed Str for
+// bulk/simple strings (0 when not numeric).
+pub fn AsInt(r: Resp) -> int64 {
+    if r.Kind == KindInt {
+        return r.Num
+    }
+    if r.Kind == KindSimpleStr || r.Kind == KindBulkStr {
+        v, ok := strconv.ParseInt64(r.Str)
+        if ok {
+            return v
+        }
+    }
+    return int64(0)
+}
+
+// AsFloat returns the reply as float — Dbl for KindDouble, Num for
+// KindInt, parsed Str for strings.
+pub fn AsFloat(r: Resp) -> float {
+    if r.Kind == KindDouble {
+        return r.Dbl
+    }
+    if r.Kind == KindInt {
+        return float(r.Num)
+    }
+    if r.Kind == KindSimpleStr || r.Kind == KindBulkStr {
+        v, ok := strconv.ParseFloat(r.Str)
+        if ok {
+            return v
+        }
+    }
+    return 0.0
+}
+
+// AsError returns the reply payload as an errors.Error — empty when the
+// reply is not an error.
+pub fn AsError(r: Resp) -> errors.Error {
+    if r.Kind == KindError {
+        return errors.New(r.Str)
+    }
+    return errors.New("")
+}
+
+// Strings flattens an array/set/push reply to its string elements.
+pub fn Strings(r: Resp) -> []string {
+    var out []string
+    for i := 0; i < len(r.Items); i = i + 1 {
+        out = append(out, AsString(r.Items[i]))
+    }
+    return out
+}
+
+// === Encoder ===
+
+// EncodeCommand serializes one command (name + args) as a RESP array of
+// bulk strings. All elements go through len-prefixing so spaces/quotes
+// in arguments need no escaping.
+pub fn EncodeCommand(args: []string) -> string {
+    b := str.NewBuilder(64 + 16 * len(args))
+    b.Write("*")
+    b.Write(strconv.Itoa(len(args)))
+    b.Write("\r\n")
+    for i := 0; i < len(args); i = i + 1 {
+        b.Write("$")
+        b.Write(strconv.Itoa(str.Len(args[i])))
+        b.Write("\r\n")
+        b.Write(args[i])
+        b.Write("\r\n")
+    }
+    out := b.String()
+    b.Free()
+    return out
+}
+
+// === Decoder ===
+
+// readLine reads one CRLF-terminated line and returns it without the
+// terminator.
+fn readLine(bc: *dbx_bufconn.BufConn) -> (string, errors.Error) {
+    line, err := bc.ReadUntil(10) // '\n'
+    if str.Len(err.message) > 0 {
+        return "", err
+    }
+    n := str.Len(line)
+    if n > 0 && line[n - 1] == 13 { // strip '\r'
+        return str.Substr(line, 0, n - 1), errors.New("")
+    }
+    return line, errors.New("")
+}
+
+// readLenLine reads a CRLF line and parses it as a decimal length.
+fn readLenLine(bc: *dbx_bufconn.BufConn) -> (int64, errors.Error) {
+    line, err := readLine(bc)
+    if str.Len(err.message) > 0 {
+        return int64(0), err
+    }
+    n, ok := strconv.ParseInt64(line)
+    if !ok {
+        return int64(0), errors.New(str.Concat("redis: bad length line ", line))
+    }
+    return n, errors.New("")
+}
+
+// maxBulkLen mirrors Redis' own proto-max-bulk-len default (512 MiB) —
+// a larger declared length means a hostile or broken peer, and letting
+// it through would size an allocation from attacker-controlled input.
+const maxBulkLen = 536870912
+
+// readBlob reads a length-prefixed payload plus its trailing CRLF.
+// n < 0 decodes to the null kind.
+fn readBlob(bc: *dbx_bufconn.BufConn, n: int64, kind: int) -> (Resp, errors.Error) {
+    if n < 0 {
+        return Resp{Kind: KindNull, Len: -1}, errors.New("")
+    }
+    if n > int64(maxBulkLen) {
+        return Resp{}, errors.New("redis: bulk length exceeds 512 MiB cap")
+    }
+    data, err := bc.ReadN(int(n))
+    if str.Len(err.message) > 0 {
+        return Resp{}, err
+    }
+    crlf, cerr := bc.ReadN(2) // trailing CRLF
+    if str.Len(cerr.message) > 0 {
+        return Resp{}, errors.New("redis: truncated bulk payload")
+    }
+    if crlf[0] != 13 || crlf[1] != 10 {
+        return Resp{}, errors.New("redis: bulk payload missing CRLF terminator")
+    }
+    return Resp{Kind: kind, Str: data, Len: int(n)}, errors.New("")
+}
+
+// readAggregate reads `count` element replies.
+fn readAggregate(bc: *dbx_bufconn.BufConn, count: int64, kind: int) -> (Resp, errors.Error) {
+    if count < 0 {
+        return Resp{Kind: KindNull, Len: -1}, errors.New("")
+    }
+    var items []Resp
+    for i := int64(0); i < count; i = i + 1 {
+        el, err := ReadReply(bc)
+        if str.Len(err.message) > 0 {
+            return Resp{}, err
+        }
+        items = append(items, el)
+    }
+    return Resp{Kind: kind, Items: items}, errors.New("")
+}
+
+// ReadReply decodes the next RESP reply from the connection. RESP3
+// attributes (|) are parsed and discarded before the real reply —
+// callers who want attributes should disable RESP3 or track them
+// out-of-band.
+pub fn ReadReply(bc: *dbx_bufconn.BufConn) -> (Resp, errors.Error) {
+    for {
+        tag, terr := bc.ReadByte()
+        if str.Len(terr.message) > 0 {
+            return Resp{}, terr
+        }
+        if tag == 43 { // '+' simple string
+            s, err := readLine(bc)
+            return Resp{Kind: KindSimpleStr, Str: s, Len: str.Len(s)}, err
+        }
+        if tag == 45 { // '-' simple error
+            s, err := readLine(bc)
+            return Resp{Kind: KindError, Str: s, Len: str.Len(s)}, err
+        }
+        if tag == 58 { // ':' integer
+            n, err := readLenLine(bc)
+            return Resp{Kind: KindInt, Num: n}, err
+        }
+        if tag == 36 { // '$' bulk string
+            n, err := readLenLine(bc)
+            if str.Len(err.message) > 0 {
+                return Resp{}, err
+            }
+            return readBlob(bc, n, KindBulkStr)
+        }
+        if tag == 61 { // '=' verbatim string
+            n, err := readLenLine(bc)
+            if str.Len(err.message) > 0 {
+                return Resp{}, err
+            }
+            return readBlob(bc, n, KindBulkStr)
+        }
+        if tag == 33 { // '!' blob error
+            n, err := readLenLine(bc)
+            if str.Len(err.message) > 0 {
+                return Resp{}, err
+            }
+            return readBlob(bc, n, KindError)
+        }
+        if tag == 40 { // '(' big number
+            s, err := readLine(bc)
+            if str.Len(err.message) > 0 {
+                return Resp{}, err
+            }
+            v, ok := strconv.ParseInt64(s)
+            if ok {
+                return Resp{Kind: KindBigNum, Str: s, Len: str.Len(s), Num: v}, errors.New("")
+            }
+            return Resp{Kind: KindBigNum, Str: s, Len: str.Len(s)}, errors.New("")
+        }
+        if tag == 44 { // ',' double
+            s, err := readLine(bc)
+            if str.Len(err.message) > 0 {
+                return Resp{}, err
+            }
+            if str.Equal(s, "inf") {
+                return Resp{Kind: KindDouble, Str: s, Len: str.Len(s), Dbl: 1.7976931348623157e308}, errors.New("")
+            }
+            if str.Equal(s, "-inf") {
+                return Resp{Kind: KindDouble, Str: s, Len: str.Len(s), Dbl: -1.7976931348623157e308}, errors.New("")
+            }
+            if str.Equal(s, "nan") || str.Equal(s, "-nan") {
+                return Resp{Kind: KindDouble, Str: s, Len: str.Len(s), Dbl: 0.0}, errors.New("")
+            }
+            v, ok := strconv.ParseFloat(s)
+            if !ok {
+                return Resp{}, errors.New(str.Concat("redis: bad double ", s))
+            }
+            return Resp{Kind: KindDouble, Str: s, Len: str.Len(s), Dbl: v}, errors.New("")
+        }
+        if tag == 35 { // '#' boolean
+            s, err := readLine(bc)
+            if str.Len(err.message) > 0 {
+                return Resp{}, err
+            }
+            return Resp{Kind: KindBool, Str: s, Len: str.Len(s), Bool: str.Equal(s, "t")}, errors.New("")
+        }
+        if tag == 95 { // '_' null
+            _, err := readLine(bc)
+            if str.Len(err.message) > 0 {
+                return Resp{}, err
+            }
+            return Resp{Kind: KindNull, Len: -1}, errors.New("")
+        }
+        if tag == 42 { // '*' array
+            n, err := readLenLine(bc)
+            if str.Len(err.message) > 0 {
+                return Resp{}, err
+            }
+            return readAggregate(bc, n, KindArray)
+        }
+        if tag == 126 { // '~' set
+            n, err := readLenLine(bc)
+            if str.Len(err.message) > 0 {
+                return Resp{}, err
+            }
+            return readAggregate(bc, n, KindSet)
+        }
+        if tag == 62 { // '>' push message
+            n, err := readLenLine(bc)
+            if str.Len(err.message) > 0 {
+                return Resp{}, err
+            }
+            return readAggregate(bc, n, KindPush)
+        }
+        if tag == 37 { // '%' map — count is pairs, read 2n elements
+            n, err := readLenLine(bc)
+            if str.Len(err.message) > 0 {
+                return Resp{}, err
+            }
+            if n > int64(4611686018427387904) { // 2^62 — n*2 would overflow
+                return Resp{}, errors.New("redis: implausible map size")
+            }
+            return readAggregate(bc, n * 2, KindMap)
+        }
+        if tag == 124 { // '|' attribute — read and discard, then continue
+            n, err := readLenLine(bc)
+            if str.Len(err.message) > 0 {
+                return Resp{}, err
+            }
+            if n > int64(4611686018427387904) { // 2^62 — n*2 would overflow
+                return Resp{}, errors.New("redis: implausible attribute size")
+            }
+            for i := int64(0); i < n * 2; i = i + 1 {
+                _, aerr := ReadReply(bc)
+                if str.Len(aerr.message) > 0 {
+                    return Resp{}, aerr
+                }
+            }
+            continue
+        }
+        return Resp{}, errors.New(str.Concat("redis: unknown reply type byte ", strconv.Itoa(tag)))
+    }
+    return Resp{}, errors.New("unreachable")
+}

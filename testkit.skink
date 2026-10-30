@@ -1,0 +1,116 @@
+// File:    testkit.skink
+// Purpose: Shared test helpers for the skink-redis suites — an
+//          in-process scripted RESP server. FakeServer accepts one
+//          connection on a loopback port, then for each incoming
+//          command (decoded with redis_resp.ReadReply on a wrapped
+//          BufConn) calls a responder fn to produce the reply bytes.
+//
+//          Kept out of the *_test.skink naming scheme on purpose — the
+//          suite harness treats every file matching *_test*.skink as a
+//          standalone test suite.
+module testkit
+
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "redis_resp"
+import "std/str"
+import "std/strconv"
+import "std/net"
+import "std/errors"
+import "std/waitgroup"
+
+// FakeServer runs one scripted RESP peer on a loopback listener.
+pub struct FakeServer {
+    listener: net.Connection // accepted-server socket (private)
+    Port:     int            // bound loopback port
+}
+
+// Serve accepts one connection on fs and answers `turns` commands by
+// calling respond with each decoded command array; the responder's
+// return value is written back verbatim. An empty return stops the
+// loop (peer sees EOF). Designed to run under `spawn`; signals the
+// waitgroup when done.
+pub fn Serve(fs: *FakeServer, turns: int, respond: fn(redis_resp.Resp) -> string, wg: *waitgroup.WaitGroup) {
+    conn, err := net.Accept(fs.listener)
+    if str.Len(err.message) > 0 {
+        waitgroup.Done(wg)
+        return
+    }
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", fs.Port)
+    for i := 0; i < turns; i = i + 1 {
+        cmd, rerr := redis_resp.ReadReply(&bc)
+        if str.Len(rerr.message) > 0 {
+            break
+        }
+        reply := respond(cmd)
+        if str.Len(reply) == 0 {
+            break
+        }
+        werr := bc.WriteAll(reply, str.Len(reply))
+        if str.Len(werr.message) > 0 {
+            break
+        }
+    }
+    bc.Close()
+    fs.listener.Close()
+    waitgroup.Done(wg)
+}
+
+// StartFakeServer listens on the given loopback port and returns a
+// FakeServer plus an armed waitgroup (Add(1) already done).
+pub fn StartFakeServer(port: int) -> (FakeServer, *waitgroup.WaitGroup, errors.Error) {
+    listener, err := net.Listen("127.0.0.1", port)
+    if str.Len(err.message) > 0 {
+        return FakeServer{}, nil, err
+    }
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    return FakeServer{listener: listener, Port: port}, wg, errors.New("")
+}
+
+// CmdName returns the upper-cased command name of a decoded request.
+pub fn CmdName(cmd: redis_resp.Resp) -> string {
+    if len(cmd.Items) == 0 {
+        return ""
+    }
+    return str.ToUpper(redis_resp.AsString(cmd.Items[0]))
+}
+
+// CmdArg returns the i-th argument as a string ("" when missing).
+pub fn CmdArg(cmd: redis_resp.Resp, i: int) -> string {
+    if i >= len(cmd.Items) {
+        return ""
+    }
+    return redis_resp.AsString(cmd.Items[i])
+}
+
+// === canned reply builders ===
+
+// Simple builds a +OK-style reply.
+pub fn Simple(s: string) -> string {
+    return str.Concat(str.Concat("+", s), "\r\n")
+}
+
+// ErrReply builds a -ERR-style reply.
+pub fn ErrReply(s: string) -> string {
+    return str.Concat(str.Concat("-", s), "\r\n")
+}
+
+// IntReply builds a :123-style reply.
+pub fn IntReply(n: int) -> string {
+    return str.Concat(str.Concat(":", strconv.Itoa(n)), "\r\n")
+}
+
+// Int64Reply builds a :123-style reply from an int64.
+pub fn Int64Reply(n: int64) -> string {
+    return str.Concat(str.Concat(":", strconv.Itoa64(n)), "\r\n")
+}
+
+// Bulk builds a $<len> reply.
+pub fn Bulk(s: string) -> string {
+    return str.Concat(str.Concat("$", str.Concat(strconv.Itoa(str.Len(s)), "\r\n")), str.Concat(s, "\r\n"))
+}
+
+// BulkNull builds the RESP null-bulk reply.
+pub fn BulkNull() -> string {
+    return "$-1\r\n"
+}

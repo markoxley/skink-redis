@@ -1,0 +1,144 @@
+// File:    live_test.skink
+// Purpose: Live integration test for skink-redis against a real Redis
+//          server. Skipped (exit 0) unless SKINK_REDIS_DSN is set —
+//          test_live.sh starts a podman redis container, exports it,
+//          and runs this binary.
+//
+//          Covers: PING, SET/GET roundtrip, INCR counters, hashes,
+//          lists, sets, sorted sets, expiry, DEL, pipeline flush, and
+//          pub/sub message delivery end-to-end.
+module main
+
+import "redis_client"
+import "redis_pipe"
+import "redis_pubsub"
+import "redis_resp"
+import "std/str"
+import "std/time"
+import "std/errors"
+import "std/waitgroup"
+import "std/os"
+
+var failures = 0
+
+// check reports a boolean assertion.
+fn check(ok: bool, what: string) {
+    if !ok {
+        println("FAIL:", what)
+        failures = failures + 1
+    }
+}
+
+// expectErr checks an errors.Error is empty.
+fn expectErr(e: errors.Error, what: string) {
+    check(str.Len(e.message) == 0, str.Concat(what, str.Concat(" -> ", e.message)))
+}
+
+// subscriber receives one pub/sub message on a second connection.
+fn subscriber(dsn: string, chanName: string, got: *string, wg: *waitgroup.WaitGroup) {
+    ps, err := redis_pubsub.DialPubSub(dsn)
+    if str.Len(err.message) > 0 {
+        waitgroup.Done(wg)
+        return
+    }
+    ps.Subscribe([]string{chanName})
+    m, rerr := ps.Receive(3000)
+    if str.Len(rerr.message) == 0 && m.Kind == redis_pubsub.MsgMessage {
+        *got = m.Payload
+    }
+    ps.Close()
+    waitgroup.Done(wg)
+}
+
+fn main() -> int {
+    dsn := os.Getenv("SKINK_REDIS_DSN")
+    if int64(dsn) == 0 || str.Len(dsn) == 0 {
+        println("SKIP live_test: SKINK_REDIS_DSN not set")
+        return 0
+    }
+    println("live test against", dsn)
+
+    c, err := redis_client.DialDSN(dsn)
+    expectErr(err, "dial")
+    if str.Len(err.message) > 0 {
+        return 1
+    }
+    expectErr(c.FlushDB(), "FLUSHDB")
+
+    expectErr(c.Ping(), "PING")
+    expectErr(c.Set("greeting", "hello"), "SET")
+    v, ok, gerr := c.GetString("greeting")
+    expectErr(gerr, "GET")
+    check(ok, "GET present")
+    check(str.Equal(v, "hello"), "GET value")
+
+    n, _ := c.Incr("counter")
+    check(n == int64(1), "INCR first")
+    n, _ = c.IncrBy("counter", int64(41))
+    check(n == int64(42), "INCRBY")
+
+    _, miss, _ := c.GetString("absent-key")
+    check(!miss, "missing key reports false")
+
+    er, eerr := c.Do2("ECHO", "pong-me")
+    expectErr(eerr, "ECHO")
+    check(str.Equal(redis_resp.AsString(er), "pong-me"), "ECHO reply")
+
+    // hashes / lists / sets / sorted sets
+    hs, _ := c.HSet("h", "f", "v")
+    check(hs == int64(1), "HSET")
+    hv, _ := c.HGet("h", "f")
+    check(str.Equal(redis_resp.AsString(hv), "v"), "HGET")
+    _, _ = c.RPush("l", []string{"a", "b", "c"})
+    lr, _ := c.LRange("l", int64(0), int64(-1))
+    check(len(lr) == 3 && str.Equal(lr[1], "b"), "LRANGE")
+    _, _ = c.SAdd("s", []string{"m1", "m2"})
+    sm, _ := c.SIsMember("s", "m2")
+    check(sm, "SISMEMBER")
+    _, _ = c.ZAdd("z", 1.5, "m")
+    zr, _ := c.ZRange("z", int64(0), int64(-1))
+    check(len(zr) == 1 && str.Equal(zr[0], "m"), "ZRANGE")
+
+    // expiry
+    expectErr(c.SetEx("exp", "x", 1), "SETEX")
+    ttl, _ := c.Ttl("exp")
+    check(ttl > int64(0) && ttl <= int64(1), "TTL bounds")
+
+    // delete
+    d, _ := c.Del([]string{"greeting", "counter"})
+    check(d == int64(2), "DEL count")
+
+    // pipeline
+    p := redis_pipe.NewPipeline(&c)
+    p.Add([]string{"SET", "pa", "1"})
+    p.Add([]string{"SET", "pb", "2"})
+    p.Add([]string{"GET", "pa"})
+    p.Add([]string{"GET", "pb"})
+    rs, perr := p.Exec()
+    expectErr(perr, "pipeline exec")
+    check(len(rs) == 4, "pipeline replies")
+    if len(rs) == 4 {
+        check(str.Equal(redis_resp.AsString(rs[2]), "1"), "pipeline GET pa")
+        check(str.Equal(redis_resp.AsString(rs[3]), "2"), "pipeline GET pb")
+    }
+
+    // pub/sub end-to-end
+    var got string
+    got = ""
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn subscriber(dsn, "events", &got, wg)
+    time.SleepMs(120) // let the subscriber attach
+    _, perr2 := c.Do3("PUBLISH", "events", "it-works")
+    expectErr(perr2, "PUBLISH")
+    waitgroup.Wait(wg)
+    check(str.Equal(got, "it-works"), "pub/sub delivery")
+
+    c.Close()
+    if failures > 0 {
+        println("live test:", failures, "failures")
+        return 1
+    }
+    println("live test: all checks passed")
+    return 0
+}

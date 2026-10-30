@@ -1,0 +1,158 @@
+// File:    client_test.skink
+// Purpose: Unit tests for redis_client — DSN connect, command/reply
+//          round trip, typed helpers, and error surfacing — all
+//          against the in-process scripted RESP server in testkit.
+module client_test
+
+import "redis_client"
+import "redis_resp"
+import "testkit"
+import "std/str"
+import "std/strconv"
+import "std/testing"
+import "std/waitgroup"
+import "std/time"
+
+var portClient = 14811
+var portClientAuth = 14812
+var portClientErr = 14813
+
+// scripted replies for TestCommands: SET→+OK, GET→bulk, INCR→:42,
+// DEL→:1, EXISTS→:2, LPUSH→:3, LRANGE→array, HGETALL→array, TTL→:99,
+// TYPE→+string, QUIT(consumed at close → not counted since Close is
+// best-effort write-only).
+fn commandsResponder(cmd: redis_resp.Resp) -> string {
+    name := testkit.CmdName(cmd)
+    if str.Equal(name, "SET") {
+        return testkit.Simple("OK")
+    }
+    if str.Equal(name, "GET") {
+        return testkit.Bulk("world")
+    }
+    if str.Equal(name, "INCR") {
+        return testkit.Int64Reply(int64(42))
+    }
+    if str.Equal(name, "DEL") {
+        return testkit.IntReply(1)
+    }
+    if str.Equal(name, "EXISTS") {
+        return testkit.IntReply(2)
+    }
+    if str.Equal(name, "LPUSH") {
+        return testkit.IntReply(3)
+    }
+    if str.Equal(name, "LRANGE") {
+        return "*2\r\n" + testkit.Bulk("a") + testkit.Bulk("b")
+    }
+    if str.Equal(name, "HGETALL") {
+        return "*2\r\n" + testkit.Bulk("f1") + testkit.Bulk("v1")
+    }
+    if str.Equal(name, "TTL") {
+        return testkit.Int64Reply(int64(99))
+    }
+    if str.Equal(name, "TYPE") {
+        return testkit.Simple("string")
+    }
+    return testkit.ErrReply("ERR unscripted " + name)
+}
+
+// TestCommands drives the typed helpers through a scripted server.
+pub fn TestCommands() {
+    fs, wg, err := testkit.StartFakeServer(portClient)
+    testing.AssertEqualString("", err.message, "listener up")
+    spawn testkit.Serve(&fs, 10, commandsResponder, wg)
+    time.SleepMs(40)
+
+    c, derr := redis_client.Connect("127.0.0.1", portClient, 0, "", "", 3000)
+    testing.AssertEqualString("", derr.message, "connect")
+
+    serr := c.Set("k", "v")
+    testing.AssertEqualString("", serr.message, "SET")
+    v, ok, gerr := c.GetString("k")
+    testing.AssertEqualString("", gerr.message, "GET err")
+    testing.AssertTrue(ok, "GET found")
+    testing.AssertEqualString("world", v, "GET value")
+    n, ierr := c.Incr("counter")
+    testing.AssertEqualString("", ierr.message, "INCR err")
+    testing.AssertTrue(n == int64(42), "INCR value")
+    d, _ := c.Del([]string{"k"})
+    testing.AssertTrue(d == int64(1), "DEL count")
+    e, _ := c.Exists([]string{"a", "b"})
+    testing.AssertTrue(e == int64(2), "EXISTS count")
+    lp, _ := c.LPush("list", []string{"x"})
+    testing.AssertTrue(lp == int64(3), "LPUSH")
+    lr, lrerr := c.LRange("list", int64(0), int64(-1))
+    testing.AssertEqualString("", lrerr.message, "LRANGE err")
+    testing.AssertEqualInt(2, len(lr), "LRANGE len")
+    testing.AssertEqualString("b", lr[1], "LRANGE[1]")
+    hall, _ := c.HGetAll("h")
+    testing.AssertEqualInt(2, len(hall), "HGETALL len")
+    t, _ := c.Ttl("k")
+    testing.AssertTrue(t == int64(99), "TTL")
+    ty, _ := c.Type("k")
+    testing.AssertEqualString("string", ty, "TYPE")
+
+    c.Close()
+    waitgroup.Wait(wg)
+}
+
+// authSelectResponder checks the handshake order: AUTH before SELECT.
+fn authSelectResponder(cmd: redis_resp.Resp) -> string {
+    name := testkit.CmdName(cmd)
+    if str.Equal(name, "AUTH") {
+        if str.Equal(testkit.CmdArg(cmd, 2), "pw") {
+            return testkit.Simple("OK")
+        }
+        return testkit.ErrReply("WRONGPASS bad credentials")
+    }
+    if str.Equal(name, "SELECT") {
+        if str.Equal(testkit.CmdArg(cmd, 1), "3") {
+            return testkit.Simple("OK")
+        }
+        return testkit.ErrReply("ERR invalid db")
+    }
+    if str.Equal(name, "PING") {
+        return testkit.Simple("PONG")
+    }
+    return testkit.ErrReply("ERR unscripted " + name)
+}
+
+// TestDSNConnect covers DialDSN: user/pass AUTH and db SELECT.
+pub fn TestDSNConnect() {
+    fs, wg, err := testkit.StartFakeServer(portClientAuth)
+    testing.AssertEqualString("", err.message, "listener up")
+    spawn testkit.Serve(&fs, 3, authSelectResponder, wg)
+    time.SleepMs(40)
+
+    c, derr := redis_client.DialDSN("redis://default:pw@127.0.0.1:" + strconv.Itoa(portClientAuth) + "/3")
+    testing.AssertEqualString("", derr.message, "dial")
+    testing.AssertEqualInt(3, c.DB(), "selected db")
+    perr := c.Ping()
+    testing.AssertEqualString("", perr.message, "PING")
+
+    c.Close()
+    waitgroup.Wait(wg)
+}
+
+// errResponder always answers errors.
+fn errResponder(cmd: redis_resp.Resp) -> string {
+    return testkit.ErrReply("ERR scripted failure")
+}
+
+// TestErrorReply checks that -ERR replies surface as errors.Error.
+pub fn TestErrorReply() {
+    fs, wg, err := testkit.StartFakeServer(portClientErr)
+    testing.AssertEqualString("", err.message, "listener up")
+    spawn testkit.Serve(&fs, 2, errResponder, wg)
+    time.SleepMs(40)
+
+    c, derr := redis_client.Connect("127.0.0.1", portClientErr, 0, "", "", 3000)
+    testing.AssertEqualString("", derr.message, "connect")
+    _, gerr := c.Do2("GET", "k")
+    testing.AssertTrue(str.Contains(gerr.message, "scripted failure"), "Do surfaces -ERR")
+    serr := c.Set("k", "v")
+    testing.AssertTrue(str.Len(serr.message) > 0, "Set surfaces -ERR")
+
+    c.Close()
+    waitgroup.Wait(wg)
+}

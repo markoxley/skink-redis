@@ -1,0 +1,104 @@
+// File:    dbx_test.skink
+// Purpose: Unit tests for redis_dbx — the dbx driver adapter: scheme
+//          registration, dbx.Open dispatch, command mapping through
+//          Query/Exec, and MULTI/EXEC transactions via Begin.
+module dbx_test
+
+import "mod/markoxley/skink-dbx/dbx_driver"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "redis_dbx"
+import "redis_resp"
+import "testkit"
+import "std/str"
+import "std/testing"
+import "std/waitgroup"
+import "std/time"
+
+var portDbx = 14841
+var portTx = 14842
+
+// dbxResponder scripts GET (bulk), SET (+OK), INCR (:9), PING (+PONG).
+fn dbxResponder(cmd: redis_resp.Resp) -> string {
+    name := testkit.CmdName(cmd)
+    if str.Equal(name, "GET") {
+        return testkit.Bulk("via-dbx")
+    }
+    if str.Equal(name, "SET") {
+        return testkit.Simple("OK")
+    }
+    if str.Equal(name, "INCR") {
+        return testkit.Int64Reply(int64(9))
+    }
+    if str.Equal(name, "PING") {
+        return testkit.Simple("PONG")
+    }
+    return testkit.ErrReply("ERR unscripted " + name)
+}
+
+// TestDbxAdapter covers registration + Query/Exec/Ping through dbx.Conn.
+pub fn TestDbxAdapter() {
+    fs, wg, err := testkit.StartFakeServer(portDbx)
+    testing.AssertEqualString("", err.message, "listener up")
+    spawn testkit.Serve(&fs, 4, dbxResponder, wg)
+    time.SleepMs(40)
+
+    redis_dbx.Register()
+    conn, oerr := dbx_driver.Open(str.Concat("redis://127.0.0.1:", "14841"))
+    testing.AssertEqualString("", oerr.message, "dbx open")
+    testing.AssertEqualString("redis", conn.Name, "driver name")
+
+    perr := conn.Ping()
+    testing.AssertEqualString("", perr.message, "ping")
+
+    rows, qerr := conn.Query("get", []dbx_value.Value{dbx_value.Text("k")})
+    testing.AssertEqualString("", qerr.message, "query err")
+    testing.AssertTrue(rows.Next(), "one row")
+    testing.AssertEqualString("via-dbx", rows.String("value"), "GET result")
+
+    n, eerr := conn.Exec("incr", []dbx_value.Value{dbx_value.Text("n")})
+    testing.AssertEqualString("", eerr.message, "exec err")
+    testing.AssertTrue(n == int64(9), "exec affected")
+
+    cerr := conn.Close()
+    testing.AssertEqualString("", cerr.message, "close")
+    waitgroup.Wait(wg)
+}
+
+// txResponder handles MULTI, queued SET/GET, EXEC.
+fn txResponder(cmd: redis_resp.Resp) -> string {
+    name := testkit.CmdName(cmd)
+    if str.Equal(name, "MULTI") {
+        return testkit.Simple("OK")
+    }
+    if str.Equal(name, "SET") || str.Equal(name, "GET") {
+        return testkit.Simple("QUEUED")
+    }
+    if str.Equal(name, "EXEC") {
+        return "*2\r\n+OK\r\n$1\r\nv\r\n"
+    }
+    return testkit.ErrReply("ERR unscripted " + name)
+}
+
+// TestDbxTx covers Begin → queued commands → Commit (EXEC).
+pub fn TestDbxTx() {
+    fs, wg, err := testkit.StartFakeServer(portTx)
+    testing.AssertEqualString("", err.message, "listener up")
+    spawn testkit.Serve(&fs, 4, txResponder, wg)
+    time.SleepMs(40)
+
+    redis_dbx.Register()
+    conn, oerr := dbx_driver.Open("redis://127.0.0.1:14842")
+    testing.AssertEqualString("", oerr.message, "dbx open")
+
+    tx, terr := conn.Begin()
+    testing.AssertEqualString("", terr.message, "begin")
+    _, e1 := tx.Exec("set", []dbx_value.Value{dbx_value.Text("a"), dbx_value.Text("1")})
+    testing.AssertEqualString("", e1.message, "queued set")
+    _, e2 := tx.Exec("get", []dbx_value.Value{dbx_value.Text("a")})
+    testing.AssertEqualString("", e2.message, "queued get")
+    cerr := tx.Commit()
+    testing.AssertEqualString("", cerr.message, "commit")
+
+    conn.Close()
+    waitgroup.Wait(wg)
+}

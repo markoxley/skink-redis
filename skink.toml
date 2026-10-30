@@ -1,0 +1,18 @@
+# Skink Project Manifest (managed by scales)
+
+[package]
+name = "redis"
+version = "0.1.0"
+author = "mark"
+entry = "redis.skink"
+description = "Redis client for Skink: RESP2/RESP3 wire codec, typed commands, pipelining, pub/sub, TLS (rediss://), and a dbx driver adapter"
+license = "Apache-2.0"
+
+[target]
+env = "std"
+no_std = false
+os = "any"
+arch = "any"
+
+[dependencies]
+"mod/markoxley/skink-dbx" = "0.1.0"

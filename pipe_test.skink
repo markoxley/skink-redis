@@ -1,0 +1,70 @@
+// File:    pipe_test.skink
+// Purpose: Unit tests for redis_pipe — batched commands flushed in a
+//          single write with replies read back in order, per-command
+//          errors kept in their Resp slots.
+module pipe_test
+
+import "redis_client"
+import "redis_pipe"
+import "redis_resp"
+import "testkit"
+import "std/str"
+import "std/testing"
+import "std/waitgroup"
+import "std/time"
+
+var portPipe = 14821
+
+// pipeResponder answers the scripted pipeline: SET, INCR, GET, bad cmd.
+fn pipeResponder(cmd: redis_resp.Resp) -> string {
+    name := testkit.CmdName(cmd)
+    if str.Equal(name, "SET") {
+        return testkit.Simple("OK")
+    }
+    if str.Equal(name, "INCR") {
+        return testkit.Int64Reply(int64(7))
+    }
+    if str.Equal(name, "GET") {
+        return testkit.Bulk("batch")
+    }
+    return testkit.ErrReply("ERR unknown in pipeline")
+}
+
+// TestPipelineExec guards the one-write/multi-read batch behavior.
+pub fn TestPipelineExec() {
+    fs, wg, err := testkit.StartFakeServer(portPipe)
+    testing.AssertEqualString("", err.message, "listener up")
+    spawn testkit.Serve(&fs, 4, pipeResponder, wg)
+    time.SleepMs(40)
+
+    c, derr := redis_client.Connect("127.0.0.1", portPipe, 0, "", "", 3000)
+    testing.AssertEqualString("", derr.message, "connect")
+
+    p := redis_pipe.NewPipeline(&c)
+    p.Add([]string{"SET", "a", "1"})
+    p.Add([]string{"INCR", "n"})
+    p.Add([]string{"GET", "a"})
+    p.Add([]string{"BOGUS"})
+    testing.AssertEqualInt(4, p.Len(), "queued")
+
+    rs, xerr := p.Exec()
+    testing.AssertEqualString("", xerr.message, "Exec err")
+    testing.AssertEqualInt(4, len(rs), "reply count")
+    testing.AssertEqualString("OK", redis_resp.AsString(rs[0]), "SET reply")
+    testing.AssertTrue(redis_resp.AsInt(rs[1]) == int64(7), "INCR reply")
+    testing.AssertEqualString("batch", redis_resp.AsString(rs[2]), "GET reply")
+    testing.AssertTrue(redis_resp.IsError(rs[3]), "bad cmd kept its error")
+    testing.AssertEqualInt(0, p.Len(), "queue drained after Exec")
+
+    c.Close()
+    waitgroup.Wait(wg)
+}
+
+// TestEmptyPipeline guards the degenerate no-command Exec.
+pub fn TestEmptyPipeline() {
+    var c redis_client.Client
+    p := redis_pipe.NewPipeline(&c)
+    rs, err := p.Exec()
+    testing.AssertEqualString("", err.message, "empty exec ok")
+    testing.AssertEqualInt(0, len(rs), "no replies")
+}

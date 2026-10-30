@@ -1,0 +1,166 @@
+// File:    resp_test.skink
+// Purpose: Unit tests for redis_resp — the RESP2/RESP3 wire codec.
+//          EncodeCommand output is asserted byte-for-byte; ReadReply is
+//          exercised against an in-process loopback peer emitting every
+//          RESP type, nested aggregates, nulls, and RESP3-only tags.
+module resp_test
+
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "redis_resp"
+import "std/str"
+import "std/net"
+import "std/time"
+import "std/errors"
+import "std/testing"
+import "std/waitgroup"
+
+var portCodec = 14801
+
+// TestEncodeCommand asserts the exact wire bytes for a command frame.
+pub fn TestEncodeCommand() {
+    got := redis_resp.EncodeCommand([]string{"SET", "key", "value"})
+    testing.AssertEqualString("*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n", got, "SET frame")
+    empty := redis_resp.EncodeCommand([]string{"PING"})
+    testing.AssertEqualString("*1\r\n$4\r\nPING\r\n", empty, "PING frame")
+    // Argument containing a space stays one bulk element.
+    sp := redis_resp.EncodeCommand([]string{"SET", "k", "a b"})
+    testing.AssertEqualString("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\na b\r\n", sp, "space arg")
+}
+
+// TestAccessors covers the Resp convenience converters.
+pub fn TestAccessors() {
+    ri := redis_resp.Resp{Kind: redis_resp.KindInt, Num: int64(42)}
+    testing.AssertTrue(redis_resp.AsInt(ri) == int64(42), "AsInt on int")
+    testing.AssertEqualString("42", redis_resp.AsString(ri), "AsString on int")
+
+    rb := redis_resp.Resp{Kind: redis_resp.KindBulkStr, Str: "12", Len: 2}
+    testing.AssertTrue(redis_resp.AsInt(rb) == int64(12), "AsInt parses bulk")
+    testing.AssertTrue(redis_resp.AsFloat(rb) > 11.9, "AsFloat parses bulk")
+
+    rd := redis_resp.Resp{Kind: redis_resp.KindDouble, Dbl: 2.5}
+    testing.AssertTrue(redis_resp.AsFloat(rd) > 2.4 && redis_resp.AsFloat(rd) < 2.6, "AsFloat on double")
+
+    rt := redis_resp.Resp{Kind: redis_resp.KindBool, Bool: true}
+    testing.AssertEqualString("true", redis_resp.AsString(rt), "AsString on bool")
+
+    rn := redis_resp.Resp{Kind: redis_resp.KindNull}
+    testing.AssertTrue(redis_resp.IsNull(rn), "IsNull")
+
+    re := redis_resp.Resp{Kind: redis_resp.KindError, Str: "ERR bad", Len: 7}
+    testing.AssertTrue(redis_resp.IsError(re), "IsError")
+    testing.AssertEqualString("ERR bad", redis_resp.AsError(re).message, "AsError payload")
+
+    arr := redis_resp.Resp{Kind: redis_resp.KindArray, Items: []redis_resp.Resp{
+        redis_resp.Resp{Kind: redis_resp.KindBulkStr, Str: "a", Len: 1},
+        redis_resp.Resp{Kind: redis_resp.KindInt, Num: int64(2)},
+    }}
+    ss := redis_resp.Strings(arr)
+    testing.AssertEqualInt(2, len(ss), "Strings length")
+    testing.AssertEqualString("a", ss[0], "Strings[0]")
+    testing.AssertEqualString("2", ss[1], "Strings[1]")
+}
+
+// scriptWriter emits a fixed byte stream on accept — for decode tests.
+fn scriptWriter(listener: net.Connection, payload: string, wg: *waitgroup.WaitGroup) {
+    conn, err := net.Accept(listener)
+    if str.Len(err.message) == 0 {
+        conn.SendAll(payload, str.Len(payload))
+        conn.Close()
+    }
+    listener.Close()
+    waitgroup.Done(wg)
+}
+
+// decodeAll starts a script server, dials it, and reads `count` replies.
+fn decodeAll(payload: string, count: int, port: int) -> []redis_resp.Resp {
+    listener, lerr := net.Listen("127.0.0.1", port)
+    wg := waitgroup.New()
+    if str.Len(lerr.message) > 0 {
+        var none []redis_resp.Resp
+        return none
+    }
+    waitgroup.Add(wg, 1)
+    spawn scriptWriter(listener, payload, wg)
+    time.SleepMs(40)
+    bc, derr := dbx_bufconn.Dial("127.0.0.1", port, 3000)
+    var out []redis_resp.Resp
+    if str.Len(derr.message) == 0 {
+        for i := 0; i < count; i = i + 1 {
+            r, rerr := redis_resp.ReadReply(&bc)
+            if str.Len(rerr.message) > 0 {
+                break
+            }
+            out = append(out, r)
+        }
+        bc.Close()
+    }
+    waitgroup.Wait(wg)
+    return out
+}
+
+// TestDecodeResp2 checks the RESP2 types over the wire.
+pub fn TestDecodeResp2() {
+    payload := str.Concat("+OK\r\n",
+        str.Concat("-ERR nope\r\n",
+        str.Concat(":1234\r\n",
+        str.Concat("$5\r\nhello\r\n",
+        str.Concat("$-1\r\n",
+        str.Concat("*3\r\n:1\r\n:2\r\n:3\r\n",
+        "*-1\r\n"))))))
+    rs := decodeAll(payload, 7, portCodec)
+    testing.AssertEqualInt(7, len(rs), "reply count")
+    testing.AssertEqualString("OK", rs[0].Str, "simple string")
+    testing.AssertTrue(redis_resp.IsError(rs[1]), "error kind")
+    testing.AssertEqualString("ERR nope", rs[1].Str, "error text")
+    testing.AssertTrue(rs[2].Num == int64(1234), "integer")
+    testing.AssertEqualString("hello", rs[3].Str, "bulk")
+    testing.AssertEqualInt(5, rs[3].Len, "bulk Len")
+    testing.AssertTrue(redis_resp.IsNull(rs[4]), "null bulk")
+    testing.AssertEqualInt(3, len(rs[5].Items), "array len")
+    testing.AssertTrue(rs[5].Items[2].Num == int64(3), "array elem")
+    testing.AssertTrue(redis_resp.IsNull(rs[6]), "null array")
+}
+
+// TestDecodeResp3 checks the RESP3-only types.
+pub fn TestDecodeResp3() {
+    payload := str.Concat("_\r\n",                          // null
+        str.Concat("#t\r\n",                               // true
+        str.Concat(",3.5\r\n",                             // double
+        str.Concat("(3492890328409238509324850943850943825024385\r\n", // bignum
+        str.Concat("~2\r\n$1\r\nx\r\n$1\r\ny\r\n",         // set
+        str.Concat("%1\r\n$4\r\nname\r\n$5\r\nredis\r\n",  // map
+        str.Concat(">3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$2\r\nhi\r\n", // push
+        "|1\r\n$4\r\nattr\r\n$4\r\nskip\r\n+REAL\r\n"))))))) // attr then real
+    rs := decodeAll(payload, 8, portCodec + 1)
+    testing.AssertEqualInt(8, len(rs), "resp3 reply count")
+    testing.AssertTrue(redis_resp.IsNull(rs[0]), "resp3 null")
+    testing.AssertTrue(rs[1].Kind == redis_resp.KindBool && rs[1].Bool, "bool true")
+    testing.AssertTrue(rs[2].Kind == redis_resp.KindDouble, "double kind")
+    testing.AssertTrue(rs[2].Dbl > 3.4 && rs[2].Dbl < 3.6, "double value")
+    testing.AssertTrue(rs[3].Kind == redis_resp.KindBigNum, "bignum kind")
+    testing.AssertTrue(rs[4].Kind == redis_resp.KindSet && len(rs[4].Items) == 2, "set")
+    testing.AssertTrue(rs[5].Kind == redis_resp.KindMap && len(rs[5].Items) == 2, "map items")
+    testing.AssertEqualString("name", rs[5].Items[0].Str, "map key")
+    testing.AssertEqualString("redis", rs[5].Items[1].Str, "map value")
+    testing.AssertTrue(rs[6].Kind == redis_resp.KindPush && len(rs[6].Items) == 3, "push frame")
+    testing.AssertEqualString("message", rs[6].Items[0].Str, "push head")
+    testing.AssertEqualString("REAL", rs[7].Str, "attribute skipped to real reply")
+}
+
+var portCap = 14851
+
+// TestBulkLengthCap — regression: a declared bulk length above the
+// 512 MiB cap must error instead of sizing an attacker-controlled
+// allocation.
+pub fn TestBulkLengthCap() {
+    rs := decodeAll("$536870913\r\n", 1, portCap)
+    testing.AssertEqualInt(0, len(rs), "oversized bulk rejected")
+}
+
+// TestBulkBadCRLF — regression: a bulk payload not followed by CRLF
+// must error; the old code consumed two unchecked bytes and silently
+// desynchronized the stream.
+pub fn TestBulkBadCRLF() {
+    rs := decodeAll("$5\r\nhelloXX", 1, portCap + 1)
+    testing.AssertEqualInt(0, len(rs), "missing CRLF rejected")
+}

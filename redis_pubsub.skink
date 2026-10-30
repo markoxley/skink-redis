@@ -1,0 +1,208 @@
+// File:    redis_pubsub.skink
+// Purpose: Redis publish/subscribe support. A PubSub owns a dedicated
+//          connection (a client in subscribe mode may only run
+//          pub/sub-shaped commands), decodes subscription acks and
+//          message deliveries — both RESP2 array form and RESP3 push
+//          form — and exposes a Receive(timeoutMs) loop.
+module redis_pubsub
+
+import "redis_client"
+import "redis_resp"
+import "std/str"
+import "std/errors"
+
+// Message kinds delivered by Receive.
+pub const MsgSubscribe   = 1 // (p)subscribe ack — Payload is the channel
+pub const MsgUnsubscribe = 2 // (p)unsubscribe ack
+pub const MsgMessage     = 3 // channel message — Channel + Payload set
+pub const MsgPMessage    = 4 // pattern message — Pattern + Channel + Payload
+pub const MsgPong        = 5 // PONG inside subscribe mode
+
+// Message is one pub/sub event.
+pub struct Message {
+    Kind:    int    // one of Msg*
+    Channel: string // channel for MsgMessage/MsgPMessage
+    Pattern: string // pattern for MsgPMessage
+    Payload: string // message body (or channel name for sub acks)
+    Count:   int64  // subscription count carried by ack frames
+}
+
+// classify decodes one subscription-frame array/push into a Message.
+// RESP2: ["message", channel, payload], ["pmessage", pat, ch, payload],
+//        ["subscribe", ch, count], ["unsubscribe", ch, count],
+//        ["pong", payload]
+// RESP3 delivers the same shapes as > push replies.
+fn classify(r: redis_resp.Resp) -> Message {
+    m := Message{Kind: 0}
+    if r.Kind != redis_resp.KindArray && r.Kind != redis_resp.KindPush {
+        return m
+    }
+    if len(r.Items) == 0 {
+        return m
+    }
+    head := str.ToLower(redis_resp.AsString(r.Items[0]))
+    if str.Equal(head, "message") && len(r.Items) >= 3 {
+        m.Kind = MsgMessage
+        m.Channel = redis_resp.AsString(r.Items[1])
+        m.Payload = redis_resp.AsString(r.Items[2])
+        return m
+    }
+    if str.Equal(head, "pmessage") && len(r.Items) >= 4 {
+        m.Kind = MsgPMessage
+        m.Pattern = redis_resp.AsString(r.Items[1])
+        m.Channel = redis_resp.AsString(r.Items[2])
+        m.Payload = redis_resp.AsString(r.Items[3])
+        return m
+    }
+    if str.Equal(head, "subscribe") || str.Equal(head, "psubscribe") {
+        m.Kind = MsgSubscribe
+        if len(r.Items) >= 3 {
+            m.Payload = redis_resp.AsString(r.Items[1])
+            m.Count = redis_resp.AsInt(r.Items[2])
+        }
+        return m
+    }
+    if str.Equal(head, "unsubscribe") || str.Equal(head, "punsubscribe") {
+        m.Kind = MsgUnsubscribe
+        if len(r.Items) >= 3 {
+            m.Payload = redis_resp.AsString(r.Items[1])
+            m.Count = redis_resp.AsInt(r.Items[2])
+        }
+        return m
+    }
+    if str.Equal(head, "pong") {
+        m.Kind = MsgPong
+        if len(r.Items) >= 2 {
+            m.Payload = redis_resp.AsString(r.Items[1])
+        }
+        return m
+    }
+    return m
+}
+
+// PubSub owns a dedicated connection in subscribe mode.
+pub struct PubSub {
+    c:    redis_client.Client // dedicated conn — do not share
+    open: bool
+
+    // Subscribe joins channels, consuming their ack frames.
+    pub fn Subscribe(self: *PubSub, channels: []string) -> errors.Error {
+        if len(channels) == 0 {
+            // A bare SUBSCRIBE errors server-side; sending it would
+            // leave a stray error frame to desync the next Receive.
+            return errors.New("redis: subscribe needs at least one channel")
+        }
+        args := []string{"SUBSCRIBE"}
+        for i := 0; i < len(channels); i = i + 1 {
+            args = append(args, channels[i])
+        }
+        return self.subAck(args, len(channels))
+    }
+
+    // PSubscribe joins pattern channels, consuming their ack frames.
+    pub fn PSubscribe(self: *PubSub, patterns: []string) -> errors.Error {
+        if len(patterns) == 0 {
+            return errors.New("redis: psubscribe needs at least one pattern")
+        }
+        args := []string{"PSUBSCRIBE"}
+        for i := 0; i < len(patterns); i = i + 1 {
+            args = append(args, patterns[i])
+        }
+        return self.subAck(args, len(patterns))
+    }
+
+    // Unsubscribe leaves channels (empty = all).
+    pub fn Unsubscribe(self: *PubSub, channels: []string) -> errors.Error {
+        args := []string{"UNSUBSCRIBE"}
+        for i := 0; i < len(channels); i = i + 1 {
+            args = append(args, channels[i])
+        }
+        return self.sendSub(args)
+    }
+
+    // PUnsubscribe leaves pattern channels (empty = all).
+    pub fn PUnsubscribe(self: *PubSub, patterns: []string) -> errors.Error {
+        args := []string{"PUNSUBSCRIBE"}
+        for i := 0; i < len(patterns); i = i + 1 {
+            args = append(args, patterns[i])
+        }
+        return self.sendSub(args)
+    }
+
+    // PingSub sends PING inside subscribe mode; the reply arrives via
+    // Receive as MsgPong.
+    pub fn PingSub(self: *PubSub) -> errors.Error {
+        return self.sendSub([]string{"PING"})
+    }
+
+    // Receive waits for the next pub/sub frame. timeoutMs <= 0 blocks
+    // forever; a positive deadline makes the underlying socket read
+    // time out and surface a "closed by peer"-style error the caller
+    // may treat as an idle tick and retry (buffered partial frames are
+    // preserved).
+    pub fn Receive(self: *PubSub, timeoutMs: int) -> (Message, errors.Error) {
+        if !self.open {
+            return Message{}, errors.New("redis: pubsub closed")
+        }
+        bc := self.c.Raw()
+        bc.SetTimeout(timeoutMs)
+        r, err := redis_resp.ReadReply(bc)
+        if str.Len(err.message) > 0 {
+            return Message{}, err
+        }
+        return classify(r), errors.New("")
+    }
+
+    // Close tears down the underlying connection.
+    pub fn Close(self: *PubSub) {
+        if !self.open {
+            return
+        }
+        self.open = false
+        self.c.Close()
+    }
+
+    // sendSub writes a subscribe-mode command without reading a reply.
+    fn sendSub(self: *PubSub, args: []string) -> errors.Error {
+        if !self.open {
+            return errors.New("redis: pubsub closed")
+        }
+        wire := redis_resp.EncodeCommand(args)
+        return self.c.Raw().WriteAll(wire, str.Len(wire))
+    }
+
+    // subAck writes a subscribe command and drains `count` ack frames.
+    fn subAck(self: *PubSub, args: []string, count: int) -> errors.Error {
+        err := self.sendSub(args)
+        if str.Len(err.message) > 0 {
+            return err
+        }
+        bc := self.c.Raw()
+        for i := 0; i < count; i = i + 1 {
+            r, rerr := redis_resp.ReadReply(bc)
+            if str.Len(rerr.message) > 0 {
+                return rerr
+            }
+            m := classify(r)
+            if m.Kind != MsgSubscribe {
+                return errors.New(str.Concat("redis: unexpected subscribe reply kind ", redis_resp.AsString(r)))
+            }
+        }
+        return errors.New("")
+    }
+}
+
+// NewPubSub wraps a client connection for subscribe-mode use. The
+// client is consumed — do not reuse it for regular commands afterwards.
+pub fn NewPubSub(c: redis_client.Client) -> PubSub {
+    return PubSub{c: c, open: true}
+}
+
+// DialPubSub connects (via DSN) and returns a PubSub bound to it.
+pub fn DialPubSub(dsn: string) -> (PubSub, errors.Error) {
+    c, err := redis_client.DialDSN(dsn)
+    if str.Len(err.message) > 0 {
+        return PubSub{}, err
+    }
+    return PubSub{c: c, open: true}, errors.New("")
+}
