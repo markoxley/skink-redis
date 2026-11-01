@@ -7,6 +7,7 @@ module resp_test
 
 import "mod/markoxley/skink-dbx/dbx_bufconn"
 import "redis_resp"
+import "testkit"
 import "std/str"
 import "std/net"
 import "std/time"
@@ -163,4 +164,12 @@ pub fn TestBulkLengthCap() {
 pub fn TestBulkBadCRLF() {
     rs := decodeAll("$5\r\nhelloXX", 1, portCap + 1)
     testing.AssertEqualInt(0, len(rs), "missing CRLF rejected")
+}
+
+// TestBulkNullReply — covers testkit.BulkNull: the decoder must map
+// "$-1" to the null kind rather than an empty bulk.
+pub fn TestBulkNullReply() {
+    rs := decodeAll(testkit.BulkNull(), 1, portCap + 2)
+    testing.AssertEqualInt(1, len(rs), "null bulk decoded")
+    testing.AssertTrue(redis_resp.IsNull(rs[0]), "null kind")
 }

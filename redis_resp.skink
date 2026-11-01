@@ -18,6 +18,11 @@ import "std/strconv"
 import "std/errors"
 import "std/libc"
 
+// Raw byte read for BufConn-delivered buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte
+// inside a bulk payload.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+
 // RESP type tags (first byte on the wire).
 pub const KindSimpleStr = 1  // +
 pub const KindError     = 2  // -  (and ! blob error)
@@ -159,7 +164,7 @@ fn readLine(bc: *dbx_bufconn.BufConn) -> (string, errors.Error) {
         return "", err
     }
     n := str.Len(line)
-    if n > 0 && line[n - 1] == 13 { // strip '\r'
+    if n > 0 && Skink_mem_byte(line, int64(n - 1)) == 13 { // strip '\r'
         return str.Substr(line, 0, n - 1), errors.New("")
     }
     return line, errors.New("")
@@ -200,7 +205,7 @@ fn readBlob(bc: *dbx_bufconn.BufConn, n: int64, kind: int) -> (Resp, errors.Erro
     if str.Len(cerr.message) > 0 {
         return Resp{}, errors.New("redis: truncated bulk payload")
     }
-    if crlf[0] != 13 || crlf[1] != 10 {
+    if Skink_mem_byte(crlf, 0) != 13 || Skink_mem_byte(crlf, 1) != 10 {
         return Resp{}, errors.New("redis: bulk payload missing CRLF terminator")
     }
     return Resp{Kind: kind, Str: data, Len: int(n)}, errors.New("")
