@@ -95,6 +95,9 @@ out the API.
 ## Generic dbx access
 
 ```skink
+import "mod/markoxley/skink-dbx"
+import "mod/markoxley/skink-dbx/dbx_value"
+
 redis.Register() // installs the "redis"/"rediss" scheme driver
 conn, err := dbx.Open("redis://127.0.0.1:6379")
 rows, _ := conn.Query("get", []dbx_value.Value{dbx_value.Text("k")})
